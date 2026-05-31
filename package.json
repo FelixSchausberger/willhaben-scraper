@@ -20,8 +20,8 @@
   "homepage": "https://github.com/FelixSchausberger/willhaben-property-scraper#readme",
   "description": "",
   "dependencies": {
+    "ajv": "^8.17.1",
     "axios": "^1.7.9",
-    "js-yaml": "^4.1.0",
     "node-fetch": "^3.3.2",
     "sops-age": "^3.1.0",
     "toml": "^3.0.0",

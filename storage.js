@@ -34,7 +34,21 @@ class Storage {
         logger.debug('No previous listing found - first run or file deleted');
         return null;
       }
-      logger.error('Error reading last seen listing:', {
+
+      // Handle permission errors gracefully
+      if (err.code === 'EACCES') {
+        logger.error('Permission denied reading storage file:', this.filePath);
+        return null; // Continue with fresh state
+      }
+
+      // Handle corrupted JSON files
+      if (err instanceof SyntaxError) {
+        logger.error('Corrupted storage file, resetting:', err.message);
+        return null; // Reset on corruption
+      }
+
+      // Unknown error - this is critical
+      logger.error('Critical storage error:', {
         error: err.message,
         code: err.code,
         filePath: this.filePath

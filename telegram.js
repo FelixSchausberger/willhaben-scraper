@@ -1,34 +1,11 @@
 import axios from 'axios';
 import logger from './logger.js';
-import { parse } from 'yaml';
-import { decryptSops } from "sops-age";
-
-async function loadSecrets(filePath, secretKey) {
-  try {
-    // Decrypt the SOPS-encrypted file
-    const decryptedFile = await decryptSops({
-      path: filePath,
-      secretKey: secretKey,
-    });
-
-    // Parse the decrypted YAML content
-    return parse(JSON.stringify(decryptedFile, null, 2));
-  } catch (error) {
-    console.error("Failed to decrypt secrets:", error.message);
-    process.exit(1);
-  }
-}
-
-// Load and decrypt the secrets
-const secretKey = process.env.SOPS_AGE_KEY; // Store this securely!
-const secrets = await loadSecrets("./secrets/secrets.yaml", secretKey);
-
-// Extract the Telegram credentials
-const apiToken = secrets.telegram.apiToken;
-const chatId = secrets.telegram.chatId;
 
 class TelegramNotifier {
-  constructor() {
+  constructor(apiToken, chatId) {
+    if (!apiToken || !chatId) {
+      throw new Error('API token and chat ID are required');
+    }
     this.apiToken = apiToken;
     this.chatId = chatId;
     this.sentListings = new Set();

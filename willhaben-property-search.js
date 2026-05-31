@@ -1,10 +1,8 @@
 import config from './toml-config-loader.js';
 import https from 'node:https';
 import logger from './logger.js';
-
-const sleep = ms => new Promise(resolve => 
-  setTimeout(resolve, ms + (Math.random() * ms * 0.5))
-);
+import { RateLimitError, BlockedError, InvalidResponseError, MissingDataError } from './lib/errors.js';
+import { sleep } from './utils.js';
 
 const categories = Object.freeze({
   'apartment rent': 'mietwohnungen',
@@ -194,6 +192,41 @@ const sanitizeForUrl = (text) => {
     .replace(/^-+|-+$/g, '');
 };
 
+// Consolidated district parsing patterns
+const DISTRICT_PATTERNS = {
+  full: /([^,]+),\s*(\d+)\.\s*Bezirk,\s*(.+)/i,
+  short: /Wien,\s*(\d+)\./
+};
+
+/**
+ * Parse district information from location string
+ * @param {string} location - Location string to parse
+ * @returns {Object|null} Object with city, number, and name or null if no match
+ */
+function parseDistrict(location) {
+  if (!location) return null;
+
+  const fullMatch = location.match(DISTRICT_PATTERNS.full);
+  if (fullMatch) {
+    return {
+      city: fullMatch[1],
+      number: fullMatch[2].padStart(2, '0'),
+      name: fullMatch[3]
+    };
+  }
+
+  const shortMatch = location.match(DISTRICT_PATTERNS.short);
+  if (shortMatch) {
+    return {
+      city: 'Wien',
+      number: shortMatch[1].padStart(2, '0'),
+      name: null
+    };
+  }
+
+  return null;
+}
+
 // Retry function with exponential backoff
 async function retry(fn, retries = 3, initialDelay = 30000) {
   for (let i = 0; i < retries; i++) {
@@ -201,35 +234,40 @@ async function retry(fn, retries = 3, initialDelay = 30000) {
       return await fn();
     } catch (error) {
       if (i === retries - 1) throw error;
-      
+
       // Exponential backoff with rate limit detection
-      const baseDelay = error.message.includes('429') 
+      const baseDelay = error instanceof RateLimitError
         ? initialDelay * 2  // Double delay for rate limits
         : initialDelay;
-      
+
       const waitTime = baseDelay * Math.pow(2, i) * (0.75 + Math.random() * 0.5);
-      logger.debug('Attempt ${i + 1} failed, retrying in ${Math.round(waitTime/1000)}s...');
+      logger.debug(`Attempt ${i + 1} failed, retrying in ${Math.round(waitTime/1000)}s...`);
       await sleep(waitTime);
     }
   }
 }
 
+// Attribute name aliases map (class-level constant for performance)
+const ATTRIBUTE_MAP = {
+  'ROOMS_TOTAL': ['ROOMS_TOTAL', 'ROOM_COUNT', 'NUMBER_OF_ROOMS'],
+  'ESTATE_SIZE': ['ESTATE_SIZE', 'LIVING_AREA'],
+  'PRICE': ['PRICE'],
+  'LOCATION': ['LOCATION'],
+  'HEADING': ['HEADING']
+};
+
 // Helper function to extract listing attributes
 function extractListingAttributes(listing) {
-  const findAttributeValue = (attrName) => {
-    const attributeMap = {
-      'ROOMS_TOTAL': ['ROOMS_TOTAL', 'ROOM_COUNT', 'NUMBER_OF_ROOMS'],
-      'ESTATE_SIZE': ['ESTATE_SIZE', 'LIVING_AREA'],
-      'PRICE': ['PRICE'],
-      'LOCATION': ['LOCATION'],
-      'HEADING': ['HEADING']
-    };
+  // Create attribute lookup map once per listing for O(1) lookups
+  const attrLookup = new Map(
+    listing.attributes?.attribute?.map(a => [a.name, a.values?.[0]]) || []
+  );
 
-    if (attributeMap[attrName]) {
-      for (const name of attributeMap[attrName]) {
-        const attr = listing.attributes?.attribute?.find(a => a.name === name);
-        if (attr?.values?.[0]) return attr.values[0];
-      }
+  const findAttributeValue = (attrName) => {
+    const aliases = ATTRIBUTE_MAP[attrName] || [attrName];
+    for (const name of aliases) {
+      const value = attrLookup.get(name);
+      if (value) return value;
     }
     return null;
   };
@@ -264,8 +302,10 @@ function isNewerListing(currentListing, lastSeenListing) {
 }
 
 class WillhabenPropertySearch {
-  constructor(telegramNotifier = null) {
+  constructor(telegramNotifier = null, options = {}) {
     this.telegramNotifier = telegramNotifier;
+    this.config = options.config || config;
+    this.logger = options.logger || logger;
     this.searchCount = 1000;
     this.searchCategory = '';
     this.searchState = null;
@@ -287,7 +327,7 @@ class WillhabenPropertySearch {
     });
 
     this.headers = {
-      'User-Agent': config.scraper.userAgent,
+      'User-Agent': this.config.scraper.userAgent,
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
       'Accept-Language': 'de-AT,de;q=0.9,en-US;q=0.8,en;q=0.7',
       'Accept-Encoding': 'gzip, deflate, br',
@@ -309,27 +349,33 @@ class WillhabenPropertySearch {
   async getListings(storage) {
     const url = this.getURL();
     const fetchWithRetry = () => retry(async () => {
-      await sleep(10000 + Math.random() * 5000);
-      logger.debug(`Fetching URL: ${url}`);
+      await sleep(10000);
+      this.logger.debug(`Fetching URL: ${url}`);
   
       const response = await fetch(url, {
         headers: this.headers,
         agent: this.agent,
         signal: AbortSignal.timeout(20000),
       });
-  
+
       if (!response.ok) {
+        if (response.status === 429) {
+          throw new RateLimitError('Rate limit exceeded', response.headers.get('retry-after'));
+        }
+        if (response.status === 403) {
+          throw new BlockedError('Access forbidden');
+        }
         throw new Error(`HTTP error! status: ${response.status}`);
       }
-  
+
       const string = await response.text();
-      logger.debug(`Response length: ${string.length}`);
-      
+      this.logger.debug(`Response length: ${string.length}`);
+
       if (!string.includes('__NEXT_DATA__')) {
-        logger.error('Response preview:', string.substring(0, 500));
-        throw new Error('Response does not contain expected data');
+        this.logger.error('Response preview:', string.substring(0, 500));
+        throw new MissingDataError('Response does not contain expected data');
       }
-  
+
       return string;
     }, 3, 30000);
   
@@ -338,32 +384,32 @@ class WillhabenPropertySearch {
       const scriptTagStart = '<script id="__NEXT_DATA__" type="application/json">';
       const startIndex = string.indexOf(scriptTagStart);
   
-      logger.debug(`Content preview: ${string.substring(0, 200)}...`);
-      logger.debug(`Found __NEXT_DATA__ at index: ${startIndex}`);
+      this.logger.debug(`Content preview: ${string.substring(0, 200)}...`);
+      this.logger.debug(`Found __NEXT_DATA__ at index: ${startIndex}`);
   
       if (startIndex === -1) {
-        logger.error('Page content preview:', string.substring(0, 500));
-        throw new Error('Could not find NEXT_DATA script tag');
+        this.logger.error('Page content preview:', string.substring(0, 500));
+        throw new MissingDataError('Could not find NEXT_DATA script tag');
       }
-  
+
       const jsonStart = startIndex + scriptTagStart.length;
       const jsonEnd = string.indexOf('</script>', jsonStart);
-      
+
       if (jsonEnd === -1) {
-        throw new Error('Could not find closing script tag');
+        throw new MissingDataError('Could not find closing script tag');
       }
-  
+
       const jsonData = string.substring(jsonStart, jsonEnd).trim();
-      
+
       if (!jsonData) {
-        throw new Error('Empty JSON data');
+        throw new MissingDataError('Empty JSON data');
       }
-  
+
       const result = JSON.parse(jsonData);
-  
+
       if (!result.props?.pageProps?.searchResult?.advertSummaryList?.advertSummary) {
-        logger.error('Invalid JSON structure:', JSON.stringify(result, null, 2).substring(0, 1000));
-        throw new Error('Invalid JSON structure');
+        this.logger.error('Invalid JSON structure:', JSON.stringify(result, null, 2).substring(0, 1000));
+        throw new InvalidResponseError('Invalid JSON structure');
       }
   
       const listings = result.props.pageProps.searchResult.advertSummaryList.advertSummary;
@@ -379,18 +425,19 @@ class WillhabenPropertySearch {
       for (const listing of listings) {
         // Extract listing attributes using the helper function
         const attributes = extractListingAttributes(listing);
-        
-        // Add URL construction logic
-        const districtMatch = attributes.location?.match(/Wien,\s*(\d+)\./);
-        const districtNum = districtMatch ? districtMatch[1].padStart(2, '0') : '';
-        const districtPart = `wien-${districtNum}90-${attributes.location?.split(',')[2]?.trim()?.toLowerCase() || ''}`;
+
+        // Add URL construction logic using parseDistrict for robustness
+        const district = parseDistrict(attributes.location);
+        const districtPart = district
+          ? `${district.city.toLowerCase()}-${district.number}90-${sanitizeForUrl(district.name || '')}`
+          : 'location-unknown';
         const titlePart = sanitizeForUrl(attributes.heading || '');
-        
+
         attributes.url = `https://www.willhaben.at/iad/immobilien/d/mietwohnungen/wien/${districtPart}/${titlePart}-${attributes.id}/`;
         attributes._lastUpdated = new Date().toISOString();
   
         // Debug logging
-        logger.debug('Processing listing:', {
+        this.logger.debug('Processing listing:', {
           id: attributes.id,
           lastSeenId: lastSeenListing?.id,
           price: attributes.price,
@@ -416,7 +463,7 @@ class WillhabenPropertySearch {
   
       // Update storage with highest valid listing
       if (highestValidListing) {
-        logger.debug('Updating last seen listing:', {
+        this.logger.debug('Updating last seen listing:', {
           id: highestValidListing.id,
           price: highestValidListing.price,
           timestamp: highestValidListing._lastUpdated
@@ -427,7 +474,7 @@ class WillhabenPropertySearch {
       return processedListings;
   
     } catch (error) {
-      logger.error('Error in getListings:', error.message);
+      this.logger.error('Error in getListings:', error.message);
       throw error;
     }
   }
@@ -437,24 +484,23 @@ class WillhabenPropertySearch {
       const pageListings = await this.getListings(storage);
   
       if (pageListings.length === 0) {
-        logger.debug('No new listings found');
+        this.logger.debug('No new listings found');
         return [];
       }
-  
+
       const filteredListings = this.applyFilters(pageListings);
-      logger.debug(`Found ${filteredListings.length} new listings that match filters`);
+      this.logger.debug(`Found ${filteredListings.length} new listings that match filters`);
       return filteredListings;
   
     } catch (error) {
-      logger.error('Search error:', error.message);
-  
+      this.logger.error('Search error:', error.message);
+
       // Only send notification for critical errors, not temporary ones
       if (
-        error.message.includes('blocked') ||
-        error.message.includes('403') ||
-        error.message.includes('429') ||
-        error.message.includes('Invalid JSON structure') ||
-        error.message.includes('Response does not contain expected data')
+        error instanceof RateLimitError ||
+        error instanceof BlockedError ||
+        error instanceof InvalidResponseError ||
+        error instanceof MissingDataError
       ) {
         if (this.telegramNotifier) {
           await this.telegramNotifier.sendErrorNotification(error);
@@ -498,7 +544,7 @@ class WillhabenPropertySearch {
     let url = 'https://www.willhaben.at/iad/immobilien/';
     
     // Support multiple states from config
-    const selectedStates = config.search.states.map(stateName => 
+    const selectedStates = this.config.search.states.map(stateName =>
       states[stateName.toLowerCase()] || states.vienna
     );
   
@@ -519,97 +565,114 @@ class WillhabenPropertySearch {
     });
     
     url += `?${params.toString()}`;
-    logger.debug(`Generated URL: ${url}`);
+    this.logger.debug(`Generated URL: ${url}`);
     return url;
   }
   
+  // Individual filter predicate methods
+  hasRequiredFields(listing) {
+    if (!listing.price || !listing.number_of_rooms) {
+      this.logger.debug(`Skipping listing ${listing.id || 'unknown'}: Missing price (${listing.price}) or rooms (${listing.number_of_rooms})`);
+      return false;
+    }
+    return true;
+  }
+
+  meetsMinPrice(listing) {
+    if (this.filters.minPrice && listing.price < this.filters.minPrice) {
+      this.logger.debug(`Filtered out listing ${listing.id}: price ${listing.price} < ${this.filters.minPrice}`);
+      return false;
+    }
+    return true;
+  }
+
+  meetsMaxPrice(listing) {
+    if (this.filters.maxPrice && listing.price > this.filters.maxPrice) {
+      this.logger.debug(`Filtered out listing ${listing.id}: price ${listing.price} > ${this.filters.maxPrice}`);
+      return false;
+    }
+    return true;
+  }
+
+  meetsMinRooms(listing) {
+    if (this.filters.minRooms && listing.number_of_rooms < this.filters.minRooms) {
+      this.logger.debug(`Filtered out listing ${listing.id}: rooms ${listing.number_of_rooms} < ${this.filters.minRooms}`);
+      return false;
+    }
+    return true;
+  }
+
+  meetsMaxRooms(listing) {
+    if (this.filters.maxRooms && listing.number_of_rooms > this.filters.maxRooms) {
+      this.logger.debug(`Filtered out listing ${listing.id}: rooms ${listing.number_of_rooms} > ${this.filters.maxRooms}`);
+      return false;
+    }
+    return true;
+  }
+
+  meetsLocationFilter(listing, activeStates, allowedDistricts) {
+    const district = parseDistrict(listing.location);
+    if (!district) return true;
+
+    const listingLocation = {
+      state: district.city.toLowerCase() === 'wien' ? 'wien' : district.city.toLowerCase(),
+      number: district.number,
+      name: district.name ? district.name.toLowerCase() : null
+    };
+
+    this.logger.debug('Listing location parsed:', JSON.stringify(listingLocation));
+
+    const isAllowedState = activeStates.includes(listingLocation.state);
+    const isAllowedDistrict = allowedDistricts.some(
+      district => district.state === listingLocation.state &&
+                  district.number === listingLocation.number &&
+                  district.name === listingLocation.name
+    );
+
+    this.logger.debug(`Listing ${listing.id}:`, { isAllowedState, isAllowedDistrict });
+
+    if (!isAllowedState || !isAllowedDistrict) {
+      this.logger.debug(`Filtered out listing ${listing.id}: state ${listingLocation.state}, district ${listingLocation.number} ${listingLocation.name} not allowed`);
+      return false;
+    }
+
+    return true;
+  }
+
   applyFilters(listings) {
-    logger.debug('=== First Stage Filtering ===');
-    logger.debug('Applied filters:', JSON.stringify(this.filters, null, 2));
-    logger.debug('Total listings before filtering:', listings.length);
-    
+    this.logger.debug('=== First Stage Filtering ===');
+    this.logger.debug('Applied filters:', JSON.stringify(this.filters, null, 2));
+    this.logger.debug('Total listings before filtering:', listings.length);
+
     // Normalize state names (vienna = wien)
-    const activeStates = config.search.states.map(stateName => 
+    const activeStates = this.config.search.states.map(stateName =>
       stateName.toLowerCase() === 'vienna' ? 'wien' : stateName.toLowerCase()
     );
-    logger.debug('Active states:', JSON.stringify(activeStates, null, 2));
+    this.logger.debug('Active states:', JSON.stringify(activeStates, null, 2));
 
-    // Parse allowed districts from config, with flexible state matching
-    const allowedDistricts = config.search.locations.map(location => {
-      const match = location.match(/([^,]+),\s*(\d+)\.\s*Bezirk,\s*(.+)/);
-      return match ? {
-        state: match[1].toLowerCase() === 'wien' ? 'wien' : match[1].toLowerCase(),
-        number: match[2].padStart(2, '0'),
-        name: match[3].toLowerCase()
+    // Parse allowed districts from config
+    const allowedDistricts = this.config.search.locations.map(location => {
+      const district = parseDistrict(location);
+      return district ? {
+        state: district.city.toLowerCase() === 'wien' ? 'wien' : district.city.toLowerCase(),
+        number: district.number,
+        name: district.name ? district.name.toLowerCase() : null
       } : null;
     }).filter(Boolean);
 
-    logger.debug('Allowed districts:', JSON.stringify(allowedDistricts, null, 2));
-    
+    this.logger.debug('Allowed districts:', JSON.stringify(allowedDistricts, null, 2));
+
+    // Apply all filter predicates
     const filteredListings = listings.filter(listing => {
-      // Price and rooms filters - keep existing logic
-      if (!listing.price || !listing.number_of_rooms) {
-        logger.debug(`Skipping listing ${listing.id || 'unknown'}: Missing price (${listing.price}) or rooms (${listing.number_of_rooms})`);
-        return false;
-      }
-
-      // Price range filter
-      if (this.filters.minPrice && listing.price < this.filters.minPrice) {
-        logger.debug(`Filtered out listing ${listing.id}: price ${listing.price} < ${this.filters.minPrice}`);
-        return false;
-      }
-      if (this.filters.maxPrice && listing.price > this.filters.maxPrice) {
-        logger.debug(`Filtered out listing ${listing.id}: price ${listing.price} > ${this.filters.maxPrice}`);
-        return false;
-      }
-
-      // Rooms range filter
-      if (this.filters.minRooms && listing.number_of_rooms < this.filters.minRooms) {
-        logger.debug(`Filtered out listing ${listing.id}: rooms ${listing.number_of_rooms} < ${this.filters.minRooms}`);
-        return false;
-      }
-      if (this.filters.maxRooms && listing.number_of_rooms > this.filters.maxRooms) {
-        logger.debug(`Filtered out listing ${listing.id}: rooms ${listing.number_of_rooms} > ${this.filters.maxRooms}`);
-        return false;
-      }
-
-      // District filtering with flexible state matching
-      const districtMatch = listing.location?.match(/([^,]+),\s*(\d+)\.\s*Bezirk,\s*(.+)/i);
-      if (districtMatch) {
-        const listingLocation = {
-          state: districtMatch[1].toLowerCase() === 'wien' ? 'wien' : districtMatch[1].toLowerCase(),
-          number: districtMatch[2].padStart(2, '0'),
-          name: districtMatch[3].toLowerCase()
-        };
-
-        // Add detailed logging
-        logger.debug('Listing location parsed:', JSON.stringify(listingLocation));
-        logger.debug('Active states:', JSON.stringify(activeStates));
-        logger.debug('Allowed districts:', JSON.stringify(allowedDistricts));
-
-        // Check if the state is active and district is allowed
-        const isAllowedState = activeStates.includes(listingLocation.state);
-        const isAllowedDistrict = allowedDistricts.some(
-          district => district.state === listingLocation.state && 
-                      district.number === listingLocation.number && 
-                      district.name === listingLocation.name
-        );
-
-        logger.debug(`Listing ${listing.id}:`, {
-          isAllowedState,
-          isAllowedDistrict
-        });
-
-        if (!isAllowedState || !isAllowedDistrict) {
-          logger.debug(`Filtered out listing ${listing.id}: state ${listingLocation.state}, district ${listingLocation.number} ${listingLocation.name} not allowed`);
-          return false;
-        }
-      }
-
-      return true;
+      return this.hasRequiredFields(listing) &&
+             this.meetsMinPrice(listing) &&
+             this.meetsMaxPrice(listing) &&
+             this.meetsMinRooms(listing) &&
+             this.meetsMaxRooms(listing) &&
+             this.meetsLocationFilter(listing, activeStates, allowedDistricts);
     });
 
-    logger.debug('Listings after first stage filtering:', filteredListings.length);
+    this.logger.debug('Listings after first stage filtering:', filteredListings.length);
     return filteredListings;
   }
 }

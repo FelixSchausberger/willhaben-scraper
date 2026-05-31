@@ -1,47 +1,44 @@
 import WillhabenPropertySearch from '../willhaben-property-search.js';
 // import Storage from '../storage.js';
 
-global.logger = {
-  debug: jest.fn(),
-  error: jest.fn()
-};
-
 describe('WillhabenPropertySearch', () => {
   let search;
-  // let mockStorage;
+  let mockConfig;
+  let mockLogger;
 
   beforeEach(() => {
-    // mockStorage = new Storage();
-    search = new WillhabenPropertySearch();
-    // Set up global config with exact district names that match the lowercase comparison
-    global.config = {
+    // Set up mock config
+    mockConfig = {
       search: {
         locations: [
-          'wien, 02. bezirk, leopoldstadt',  // Lowercase to match the function's behavior
-          'wien, 03. bezirk, landstraße'     // Lowercase to match the function's behavior
+          'wien, 02. bezirk, leopoldstadt',
+          'wien, 03. bezirk, landstraße'
         ],
         states: ['vienna']
+      },
+      scraper: {
+        userAgent: 'Test User Agent'
       }
     };
 
-    global.logger = {
+    // Set up mock logger
+    mockLogger = {
       debug: jest.fn(),
       error: jest.fn()
     };
 
-    search = new WillhabenPropertySearch();
-    
+    // Create search instance with injected dependencies
+    search = new WillhabenPropertySearch(null, {
+      config: mockConfig,
+      logger: mockLogger
+    });
+
     search.filter({
       minPrice: null,
       maxPrice: null,
       minRooms: null,
       maxRooms: null
     });
-  });
-
-  afterEach(() => {
-    // Clean up global config after each test
-    delete global.config;
   });
 
   describe('initialization', () => {
@@ -135,14 +132,17 @@ describe('WillhabenPropertySearch', () => {
         }
       ];
 
-      // Ensure config matches exact parsing logic in the method
-      global.config = {
+      // Update instance config for this test
+      search.config = {
         search: {
           states: ['vienna'],
           locations: [
             'wien, 02. Bezirk, Leopoldstadt',
             'wien, 03. Bezirk, Landstraße'
           ]
+        },
+        scraper: {
+          userAgent: 'Test User Agent'
         }
       };
 
@@ -164,15 +164,15 @@ describe('WillhabenPropertySearch', () => {
 
   describe('getListings integration', () => {
     test('should filter out previously seen listings with storage', async () => {
-      const search = new WillhabenPropertySearch();
-      search.filter({
+      const testSearch = new WillhabenPropertySearch(null, {
+        config: mockConfig,
+        logger: mockLogger
+      });
+      testSearch.filter({
         minPrice: 500,
         maxPrice: 1500
       });
-   
-      search.sleep = jest.fn().mockResolvedValue(null);
-      search.retry = jest.fn(async (fn) => await fn());
-   
+
       const mockResponse = {
         props: {
           pageProps: {
@@ -232,12 +232,12 @@ describe('WillhabenPropertySearch', () => {
         updateLastSeenListing: jest.fn()
       };
    
-      const listings = await search.getListings(mockStorage);
-      
+      const listings = await testSearch.getListings(mockStorage);
+
       // Debug logging
-      // console.log('Filters:', search.filters);
+      // console.log('Filters:', testSearch.filters);
       // console.log('Processed listings:', listings);
-      
+
       const resultIds = listings.map(l => l.id).sort();
       expect(resultIds).toEqual(['3']);
       expect(listings).toHaveLength(1);

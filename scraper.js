@@ -1,50 +1,32 @@
 import WillhabenPropertySearch from './willhaben-property-search.js';
 import Storage from './storage.js';
 import TelegramNotifier from './telegram.js';
-import { parse } from 'yaml';
 import config from './toml-config-loader.js';
 import logger from './logger.js';
 import { sleep } from './utils.js';
-import path from 'path';
-import { decryptSops } from "sops-age";
-
-async function loadSecrets(filePath, secretKey) {
-  try {
-    // Decrypt the SOPS-encrypted file
-    const decryptedFile = await decryptSops({
-      path: filePath,
-      secretKey: secretKey,
-    });
-
-    // Parse the decrypted YAML content
-    return parse(JSON.stringify(decryptedFile, null, 2));
-  } catch (error) {
-    console.error("Failed to decrypt secrets:", error.message);
-    process.exit(1);
-  }
-}
-
-// Load and decrypt the secrets
-const secretKey = process.env.SOPS_AGE_KEY; // Store this securely!
-const secrets = await loadSecrets("./secrets/secrets.yaml", secretKey);
-
-// Extract the Telegram credentials
-const apiToken = secrets.telegram.apiToken;
-const chatId = secrets.telegram.chatId;
+import { STORAGE_PATH } from './lib/constants.js';
 
 export default class PropertyScraper {
-  constructor() {
+  constructor(secrets) {
+    if (!secrets?.telegram?.apiToken || !secrets?.telegram?.chatId) {
+      throw new Error('Telegram credentials are required in secrets');
+    }
+
     // Initialize storage with proper path and create data directory
-    this.storage = new Storage(path.join(process.cwd(), 'data', 'last_seen_listing.json'));
-    
+    this.storage = new Storage(STORAGE_PATH);
+
+    // Extract credentials from secrets
+    this.apiToken = secrets.telegram.apiToken;
+    this.chatId = secrets.telegram.chatId;
+
     this.notifier = new TelegramNotifier(
-      this.apiToken = apiToken,
-      this.chatId = chatId
+      this.apiToken,
+      this.chatId
     );
-    
+
     // Pass the notifier instance when creating WillhabenPropertySearch
-    this.search = new WillhabenPropertySearch(this.notifier, process.argv.includes('--debug'));
-    
+    this.search = new WillhabenPropertySearch(this.notifier);
+
     // Track scraper statistics
     this.stats = {
       startTime: new Date(),
